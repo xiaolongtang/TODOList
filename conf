@@ -1,0 +1,35 @@
+<configuration>
+
+  <!-- PERF LOG -->
+  <appender name="PERF_LOG" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>logs/perf.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+      <fileNamePattern>logs/perf.%d{yyyy-MM-dd}.log</fileNamePattern>
+    </rollingPolicy>
+    <encoder>
+      <pattern>%date [%thread] %-5level %logger - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- SLOW SQL -->
+  <appender name="SLOW_SQL" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>logs/slow.sql</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+      <fileNamePattern>logs/slow.%d{yyyy-MM-dd}.sql</fileNamePattern>
+    </rollingPolicy>
+    <encoder>
+      <pattern>%date [%thread] %-5level %logger - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- perfLogger -->
+  <logger name="sql.performance" level="INFO" additivity="false">
+    <appender-ref ref="PERF_LOG"/>
+  </logger>
+
+  <!-- slowLogger -->
+  <logger name="sql.slow" level="WARN" additivity="false">
+    <appender-ref ref="SLOW_SQL"/>
+  </logger>
+
+</configuration>
