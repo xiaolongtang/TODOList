@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns="http://www.ehcache.org/v3"
+    xmlns:jsr107="http://www.ehcache.org/v3/jsr107"
+    xsi:schemaLocation="
+      http://www.ehcache.org/v3
+      http://www.ehcache.org/schema/ehcache-core.xsd
+      http://www.ehcache.org/v3/jsr107
+      http://www.ehcache.org/schema/ehcache-107-ext.xsd">
+
+  <!-- 通过 JCache 扩展，在所有 cache 上默认开启管理和统计 MBean -->
+  <service>
+    <jsr107:defaults enable-management="true" enable-statistics="true"/>
+  </service>
+
+  <!-- 你的各个 cache 定义 -->
+  <cache alias="myCache">
+    <key-type>java.lang.String</key-type>
+    <value-type>java.lang.Object</value-type>
+    <expiry><ttl unit="seconds">3600</ttl></expiry>
+    <resources>
+      <heap unit="entries">1000</heap>
+      <offheap unit="MB">100</offheap>
+      <disk unit="MB">500" persistent="true"/>
+    </resources>
+  </cache>
+
+</config>
