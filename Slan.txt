@@ -1,0 +1,185 @@
+先帮你把这条 SQL“翻译”一下，再给一个等价但更适合 H2 的写法 + 索引建议。
+
+⸻
+
+1. 你这条 SQL 在干什么（抽象一下）
+
+简化后逻辑大概是：
+
+SELECT btx.id
+FROM BUSINESS_TERM_XREF btx
+WHERE btx.current_indicator = 1
+  AND btx.model_id IN (                           -- 找到这些 model_id 对应的业务术语
+    SELECT dmx.source_model_id
+    FROM DATA_MODEL_XREF dmx
+    WHERE dmx.current_indicator = 1
+      AND dmx.target_model_id IN (                -- 这些 target model
+        SELECT dm2.model_id
+        FROM DATA_MODEL dm2
+        WHERE dm2.field_name IN (                 -- 拥有这些字段名
+          SELECT dm1.field_name
+          FROM DATA_MODEL dm1
+          WHERE dm1.model_id IN (                 -- 这些 model
+            SELECT dm.model_id
+            FROM DATA_MODEL dm
+            JOIN BUSINESS_TERM_ATTRIBUTES bta
+                 ON dm.id = bta.entity_ref_id
+            GROUP BY dm.model_id
+            HAVING MAX(dm.current_indicator) = 0  -- 这个 model 下的行 current 都是 0
+          )
+        )
+      )
+  );
+
+问题点基本有三类：
+	1.	4 层 IN (SELECT …)，里层还有 DISTINCT / GROUP BY，非常难优化；
+	2.	相同的子查询在执行计划里被展开了多次，形成“巨大的逻辑树”；
+	3.	GROUP BY / HAVING 没有针对性索引的话，会对 DATA_MODEL 做大范围扫描。
+
+⸻
+
+2. 推荐的重写方式（用 CTE + JOIN）
+
+把每一层子查询拆成一个 CTE，全部改成 JOIN / EXISTS，给优化器更多空间：
+
+WITH bad_models AS (          -- ① 先找出“坏的” model_id
+    SELECT dm.model_id
+    FROM DATA_MODEL dm
+    JOIN BUSINESS_TERM_ATTRIBUTES bta
+      ON dm.id = bta.entity_ref_id
+    GROUP BY dm.model_id
+    HAVING MAX(dm.current_indicator) = 0
+),
+bad_fields AS (               -- ② 这些 model 下出现过的 field_name
+    SELECT DISTINCT dm1.field_name
+    FROM DATA_MODEL dm1
+    JOIN bad_models bm
+      ON dm1.model_id = bm.model_id
+),
+target_models AS (            -- ③ 拥有这些 field_name 的其它 model_id
+    SELECT DISTINCT dm2.model_id
+    FROM DATA_MODEL dm2
+    JOIN bad_fields bf
+      ON dm2.field_name = bf.field_name
+),
+source_models AS (            -- ④ 在 XREF 里，指向这些 target_model 的 source_model
+    SELECT DISTINCT dmx.source_model_id
+    FROM DATA_MODEL_XREF dmx
+    JOIN target_models tm
+      ON dmx.target_model_id = tm.model_id
+    WHERE dmx.current_indicator = 1
+)
+SELECT DISTINCT btx.id        -- ⑤ 最外层：业务术语
+FROM BUSINESS_TERM_XREF btx
+JOIN source_models sm
+  ON btx.model_id = sm.source_model_id
+WHERE btx.current_indicator = 1;
+
+再激进一点，可以连 CTE 都不要，直接连成一条大 JOIN（让优化器自己重排顺序），但上面这个版本结构清晰，方便你看问题。
+
+如果你想完全不用 GROUP BY，也可以把 bad_models 改成：
+
+bad_models AS (
+    SELECT DISTINCT dm.model_id
+    FROM DATA_MODEL dm
+    JOIN BUSINESS_TERM_ATTRIBUTES bta
+      ON dm.id = bta.entity_ref_id
+    WHERE dm.current_indicator = 0
+      AND NOT EXISTS (
+          SELECT 1
+          FROM DATA_MODEL d2
+          WHERE d2.model_id = dm.model_id
+            AND d2.current_indicator <> 0
+      )
+)
+
+对于 H2 来说，这种 NOT EXISTS + 好索引，常常会比 GROUP BY ... HAVING MAX(...) 更好一点。
+
+⸻
+
+3. 建议的索引（按 join / 条件逐个说）
+
+下面索引名你可以按自己规范起，只要列顺序差不多就行。
+
+3.1 BUSINESS_TERM_XREF（btx）
+
+条件：btx.current_indicator = 1
+连接：btx.model_id（和 source_models 里的 source_model_id 对应）
+
+CREATE INDEX IDX_BTX_CURR_MODEL
+    ON BUSINESS_TERM_XREF (CURRENT_INDICATOR, MODEL_ID);
+
+3.2 DATA_MODEL_XREF（dmx）
+
+条件：dmx.current_indicator = 1
+连接：dmx.target_model_id、dmx.source_model_id
+
+CREATE INDEX IDX_DMX_CURR_TARGET_SRC
+    ON DATA_MODEL_XREF (CURRENT_INDICATOR, TARGET_MODEL_ID, SOURCE_MODEL_ID);
+-- 如果表很大，也可以单独再建：
+-- CREATE INDEX IDX_DMX_TARGET ON DATA_MODEL_XREF (TARGET_MODEL_ID);
+
+3.3 DATA_MODEL（dm, dm1, dm2）
+
+用法：
+	•	bad_models：GROUP BY dm.model_id + 条件 dm.current_indicator；
+	•	bad_fields：JOIN bad_models ON dm1.model_id；
+	•	target_models：JOIN bad_fields ON dm2.field_name。
+
+建议：
+
+-- 面向“哪些 model 的 current_indicator 全是 0”
+CREATE INDEX IDX_DM_MODEL_CURR
+    ON DATA_MODEL (MODEL_ID, CURRENT_INDICATOR);
+
+-- 面向通过 field_name 反查 model_id 的场景
+CREATE INDEX IDX_DM_FIELD_NAME
+    ON DATA_MODEL (FIELD_NAME, MODEL_ID);
+
+（如果 DATA_MODEL 已经以 ID 为主键，就不需要再单独给 ID 建索引了。）
+
+3.4 BUSINESS_TERM_ATTRIBUTES（bta）
+
+用法：JOIN ... ON dm.id = bta.entity_ref_id
+
+CREATE INDEX IDX_BTA_ENTITY_REF
+    ON BUSINESS_TERM_ATTRIBUTES (ENTITY_REF_ID);
+
+（从执行计划截图看，你大概率已经有类似索引，如果有就不用重复建。）
+
+⸻
+
+4. H2 上额外的几个小优化点
+	1.	建完索引后一定跑一次统计：
+
+ANALYZE;
+-- 或者只针对这几个表
+ANALYZE TABLE BUSINESS_TERM_XREF;
+ANALYZE TABLE DATA_MODEL_XREF;
+ANALYZE TABLE DATA_MODEL;
+ANALYZE TABLE BUSINESS_TERM_ATTRIBUTES;
+
+不 ANAYLZE，优化器可能完全选不到你刚建的好索引。
+
+	2.	用 EXPLAIN ANALYZE 验证
+对重写后的 SQL：
+
+EXPLAIN ANALYZE
+WITH ...
+SELECT ...
+
+看每一步：
+	•	是否走了你期望的索引（执行计划里的注释会写出来）；
+	•	中间步骤的 scanCount / row 数是不是已经从“几百万/几千万”降到“几万以下”。
+
+	3.	结果量很大时，确保只要必要的列
+你现在只要 btx.id，已经很好了，避免了 SELECT * 带来的多余 IO。
+
+⸻
+
+5. 总结一句话
+	•	现在这条 SQL 慢，根本原因是多层嵌套 IN + 聚合子查询，让 H2 很难做出好执行计划；
+	•	推荐把逻辑拆成 CTE / JOIN / EXISTS 的形式，并针对 join/过滤列建复合索引；
+	•	建完索引一定要 ANALYZE，再通过 EXPLAIN ANALYZE 看是否真正用上。
+
+你可以先按上面的 CTE 版本跑一遍（哪怕先不用索引），看逻辑结果和原 SQL 一不一样；确认没问题后再按索引 + ANALYZE 的步骤逐步压时间。如果你愿意，把 EXPLAIN ANALYZE 的文本复制出来（而不是截图），我可以再帮你看一下哪些步骤还是热点。
