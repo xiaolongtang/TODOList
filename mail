@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+
+import argparse
+import getpass
+import os
+import smtplib
+import ssl
+import sys
+from email.message import EmailMessage
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="使用 Python 标准库测试 SMTP 连接并发送邮件"
+    )
+
+    parser.add_argument("--host", required=True, help="SMTP 服务器地址")
+    parser.add_argument("--port", type=int, required=True, help="SMTP 服务器端口")
+
+    parser.add_argument(
+        "--mode",
+        choices=["plain", "starttls", "ssl"],
+        default="plain",
+        help="连接模式：plain、starttls 或 ssl，默认 plain",
+    )
+
+    parser.add_argument("--username", help="SMTP 用户名")
+    parser.add_argument(
+        "--password-env",
+        default="SMTP_PASSWORD",
+        help="保存密码的环境变量名，默认 SMTP_PASSWORD",
+    )
+
+    parser.add_argument("--from", dest="from_addr", required=True, help="发件人地址")
+    parser.add_argument("--to", dest="to_addr", required=True, help="收件人地址")
+
+    parser.add_argument(
+        "--subject",
+        default="SMTP test",
+        help="邮件主题，默认 SMTP test",
+    )
+    parser.add_argument(
+        "--body",
+        default="This is a test email sent by smtp_test.py.",
+        help="邮件正文",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10,
+        help="连接超时时间，默认 10 秒",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="输出完整 SMTP 会话日志",
+    )
+    parser.add_argument(
+        "--connect-only",
+        action="store_true",
+        help="只测试连接、TLS 和认证，不发送邮件",
+    )
+
+    return parser.parse_args()
+
+
+def get_password(args):
+    if not args.username:
+        return None
+
+    password = os.environ.get(args.password_env)
+
+    if password is None:
+        password = getpass.getpass(
+            f"请输入 SMTP 密码，或设置环境变量 {args.password_env}: "
+        )
+
+    return password
+
+
+def create_message(args):
+    message = EmailMessage()
+    message["From"] = args.from_addr
+    message["To"] = args.to_addr
+    message["Subject"] = args.subject
+    message.set_content(args.body)
+    return message
+
+
+def connect_smtp(args):
+    context = ssl.create_default_context()
+
+    if args.mode == "ssl":
+        smtp = smtplib.SMTP_SSL(
+            host=args.host,
+            port=args.port,
+            timeout=args.timeout,
+            context=context,
+        )
+    else:
+        smtp = smtplib.SMTP(
+            host=args.host,
+            port=args.port,
+            timeout=args.timeout,
+        )
+
+    if args.debug:
+        smtp.set_debuglevel(1)
+
+    # 主动发送 EHLO，便于查看服务器支持的功能。
+    smtp.ehlo()
+
+    if args.mode == "starttls":
+        smtp.starttls(context=context)
+        # TLS 建立后应重新发送 EHLO。
+        smtp.ehlo()
+
+    return smtp
+
+
+def main():
+    args = parse_args()
+    password = get_password(args)
+
+    smtp = None
+
+    try:
+        print(f"正在连接 {args.host}:{args.port}，模式：{args.mode}")
+
+        smtp = connect_smtp(args)
+
+        print("SMTP 连接成功")
+        print(f"服务器支持的扩展：{smtp.esmtp_features}")
+
+        if args.username:
+            smtp.login(args.username, password)
+            print("SMTP 认证成功")
+
+        if args.connect_only:
+            print("连接测试完成，未发送邮件")
+            return 0
+
+        message = create_message(args)
+        smtp.send_message(message)
+
+        print("测试邮件发送成功")
+        print(f"发件人：{args.from_addr}")
+        print(f"收件人：{args.to_addr}")
+        return 0
+
+    except smtplib.SMTPAuthenticationError as exc:
+        print(
+            f"SMTP 认证失败：状态码={exc.smtp_code}，响应={exc.smtp_error!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    except smtplib.SMTPRecipientsRefused as exc:
+        print(f"收件人被拒绝：{exc.recipients}", file=sys.stderr)
+        return 3
+
+    except smtplib.SMTPSenderRefused as exc:
+        print(
+            f"发件人被拒绝：状态码={exc.smtp_code}，响应={exc.smtp_error!r}",
+            file=sys.stderr,
+        )
+        return 4
+
+    except smtplib.SMTPConnectError as exc:
+        print(
+            f"SMTP 连接失败：状态码={exc.smtp_code}，响应={exc.smtp_error!r}",
+            file=sys.stderr,
+        )
+        return 5
+
+    except smtplib.SMTPException as exc:
+        print(f"SMTP 错误：{exc}", file=sys.stderr)
+        return 6
+
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        print(f"网络连接错误：{exc}", file=sys.stderr)
+        return 7
+
+    except ssl.SSLError as exc:
+        print(f"TLS/SSL 错误：{exc}", file=sys.stderr)
+        return 8
+
+    finally:
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
